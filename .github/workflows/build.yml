@@ -1,0 +1,444 @@
+name: Build APK
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+
+    - name: Setup Android SDK
+      uses: android-actions/setup-android@v3
+
+    - name: Create Project Files
+      run: |
+        mkdir -p app/src/main/kotlin/com/bench/fps
+        mkdir -p app/src/main/res/values
+        cat > settings.gradle << 'EOF'
+        pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+        dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+        rootProject.name = "FpsShooter"
+        include ":app"
+        EOF
+
+        cat > build.gradle << 'EOF'
+        plugins {
+            id 'com.android.application' version '8.5.2' apply false
+            id 'org.jetbrains.kotlin.android' version '1.9.24' apply false
+        }
+        EOF
+
+        cat > gradle.properties << 'EOF'
+        org.gradle.jvmargs=-Xmx2048m
+        android.useAndroidX=true
+        kotlin.code.style=official
+        EOF
+
+        cat > app/build.gradle << 'EOF'
+        plugins {
+            id 'com.android.application'
+            id 'org.jetbrains.kotlin.android'
+        }
+        android {
+            namespace 'com.bench.fps'
+            compileSdk 34
+            defaultConfig {
+                applicationId "com.bench.fps"
+                minSdk 24
+                targetSdk 34
+                versionCode 1
+                versionName "1.0"
+            }
+            buildTypes { release { minifyEnabled false } }
+            compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+            kotlinOptions { jvmTarget = '17' }
+        }
+        dependencies { }
+        EOF
+
+        cat > app/src/main/AndroidManifest.xml << 'EOF'
+        <?xml version="1.0" encoding="utf-8"?>
+        <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <uses-feature android:glEsVersion="0x00030000" android:required="true"/>
+            <application android:label="FpsShooter" android:theme="@android:style/Theme.NoTitleBar.Fullscreen" android:hardwareAccelerated="true">
+                <activity android:name=".MainActivity" android:screenOrientation="landscape" android:configChanges="orientation|screenSize|keyboardHidden" android:exported="true">
+                    <intent-filter>
+                        <action android:name="android.intent.action.MAIN"/>
+                        <category android:name="android.intent.category.LAUNCHER"/>
+                    </intent-filter>
+                </activity>
+            </application>
+        </manifest>
+        EOF
+
+        cat > app/src/main/res/values/strings.xml << 'EOF'
+        <resources><string name="app_name">FpsShooter</string></resources>
+        EOF
+
+        K=app/src/main/kotlin/com/bench/fps
+        
+        cat > $K/MainActivity.kt << 'EOF'
+        package com.bench.fps
+        import android.app.Activity
+        import android.os.Bundle
+        import android.view.WindowManager
+        class MainActivity : Activity() {
+            private lateinit var view: GameView
+            override fun onCreate(savedInstanceState: Bundle?) {
+                super.onCreate(savedInstanceState)
+                window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                view = GameView(this)
+                setContentView(view)
+            }
+            override fun onResume() { super.onResume(); view.onResume() }
+            override fun onPause() { view.onPause(); super.onPause() }
+        }
+        EOF
+
+        cat > $K/GameView.kt << 'EOF'
+        package com.bench.fps
+        import android.content.Context
+        import android.opengl.GLSurfaceView
+        import android.view.MotionEvent
+        class GameView(ctx: Context) : GLSurfaceView(ctx) {
+            val controls = TouchControls()
+            val renderer = GameRenderer(ctx, controls)
+            init {
+                setEGLContextClientVersion(3)
+                preserveEGLContextOnPause = true
+                setRenderer(renderer)
+                renderMode = RENDERMODE_CONTINUOUSLY
+            }
+            override fun onTouchEvent(e: MotionEvent): Boolean {
+                controls.onTouch(e, width.toFloat(), height.toFloat())
+                return true
+            }
+        }
+        EOF
+
+        cat > $K/Player.kt << 'EOF'
+        package com.bench.fps
+        import kotlin.math.cos
+        import kotlin.math.sin
+        class Player {
+            var x = 0f; var y = 1.7f; var z = 0f
+            var yaw = 0f; var pitch = 0f
+            var hp = 100
+            var alive = true
+            fun forward(): FloatArray {
+                val cy = cos(yaw); val sy = sin(yaw)
+                val cp = cos(pitch); val sp = sin(pitch)
+                return floatArrayOf(sy * cp, sp, -cy * cp)
+            }
+            fun takeDamage(d: Int) {
+                hp -= d
+                if (hp <= 0) { hp = 0; alive = false }
+            }
+        }
+        EOF
+
+        cat > $K/Enemy.kt << 'EOF'
+        package com.bench.fps
+        class Enemy {
+            var x = 0f; var z = 0f
+            var alive = true
+            var hpHead = 30
+            var hpTorso = 100
+            var hpLegs = 60
+            var respawnAt = 0L
+            fun zone(hitY: Float): Int = when {
+                hitY > 1.55f -> 0
+                hitY > 0.75f -> 1
+                else -> 2
+            }
+            fun damage(zone: Int, dmg: Int) {
+                when (zone) {
+                    0 -> { hpHead -= dmg * 3; if (hpHead <= 0) kill() }
+                    1 -> { hpTorso -= dmg; if (hpTorso <= 0) kill() }
+                    else -> { hpLegs -= dmg; if (hpLegs <= 0) kill() }
+                }
+            }
+            private fun kill() { alive = false; respawnAt = System.currentTimeMillis() + 4000 }
+        }
+        EOF
+
+        cat > $K/World.kt << 'EOF'
+        package com.bench.fps
+        import kotlin.math.sqrt
+        import kotlin.random.Random
+        class World {
+            val enemies = ArrayList<Enemy>()
+            init { repeat(6) { spawn() } }
+            fun spawn() {
+                val e = Enemy()
+                e.x = Random.nextFloat() * 16f - 8f
+                e.z = Random.nextFloat() * 16f - 8f
+                enemies.add(e)
+            }
+            fun respawnTick() {
+                val now = System.currentTimeMillis()
+                for (e in enemies) if (!e.alive && now >= e.respawnAt) {
+                    e.alive = true; e.hpHead = 30; e.hpTorso = 100; e.hpLegs = 60
+                    e.x = Random.nextFloat() * 16f - 8f
+                    e.z = Random.nextFloat() * 16f - 8f
+                }
+            }
+            fun raycast(px: Float, py: Float, pz: Float, dx: Float, dy: Float, dz: Float): Triple<Enemy, Int, Float>? {
+                var best: Triple<Enemy, Int, Float>? = null
+                var bestDist = Float.MAX_VALUE
+                for (e in enemies) {
+                    if (!e.alive) continue
+                    var t = 0.2f
+                    while (t < 40f) {
+                        val wx = px + dx * t; val wy = py + dy * t; val wz = pz + dz * t
+                        val dxz = sqrt((wx - e.x) * (wx - e.x) + (wz - e.z) * (wz - e.z))
+                        if (dxz < 0.35f && wy > 0f && wy < 1.8f) {
+                            if (t < bestDist) { bestDist = t; best = Triple(e, e.zone(wy), t) }
+                            break
+                        }
+                        t += 0.1f
+                    }
+                }
+                return best
+            }
+        }
+        EOF
+
+        cat > $K/Mesh.kt << 'EOF'
+        package com.bench.fps
+        import android.opengl.GLES30
+        import java.nio.ByteBuffer
+        import java.nio.ByteOrder
+        class Mesh(vertices: FloatArray) {
+            val vbo: Int
+            val count: Int = vertices.size / 6
+            init {
+                val bb = ByteBuffer.allocateDirect(vertices.size * 4).order(ByteOrder.nativeOrder())
+                val fb = bb.asFloatBuffer(); fb.put(vertices); fb.position(0)
+                val arr = IntArray(1); GLES30.glGenBuffers(1, arr, 0)
+                vbo = arr[0]
+                GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, vbo)
+                GLES30.glBufferData(GLES30.GL_ARRAY_BUFFER, vertices.size * 4, fb, GLES30.GL_STATIC_DRAW)
+            }
+            fun draw() {
+                GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, vbo)
+                GLES30.glEnableVertexAttribArray(0)
+                GLES30.glVertexAttribPointer(0, 3, GLES30.GL_FLOAT, false, 24, 0)
+                GLES30.glEnableVertexAttribArray(1)
+                GLES30.glVertexAttribPointer(1, 3, GLES30.GL_FLOAT, false, 24, 12)
+                GLES30.glDrawArrays(GLES30.GL_TRIANGLES, 0, count)
+            }
+            companion object {
+                fun cube(cx: Float, cy: Float, cz: Float, sx: Float, sy: Float, sz: Float, r: Float, g: Float, b: Float): FloatArray {
+                    val hx = sx / 2; val hy = sy / 2; val hz = sz / 2
+                    val p = arrayOf(
+                        floatArrayOf(cx - hx, cy - hy, cz - hz), floatArrayOf(cx + hx, cy - hy, cz - hz),
+                        floatArrayOf(cx + hx, cy + hy, cz - hz), floatArrayOf(cx - hx, cy + hy, cz - hz),
+                        floatArrayOf(cx - hx, cy - hy, cz + hz), floatArrayOf(cx + hx, cy - hy, cz + hz),
+                        floatArrayOf(cx + hx, cy + hy, cz + hz), floatArrayOf(cx - hx, cy + hy, cz + hz)
+                    )
+                    val idx = intArrayOf(0,1,2, 0,2,3, 4,6,5, 4,7,6, 0,4,5, 0,5,1, 3,2,6, 3,6,7, 0,3,7, 0,7,4, 1,5,6, 1,6,2)
+                    val out = FloatArray(idx.size * 6)
+                    var k = 0
+                    for (i in idx) {
+                        out[k++] = p[i][0]; out[k++] = p[i][1]; out[k++] = p[i][2]
+                        out[k++] = r; out[k++] = g; out[k++] = b
+                    }
+                    return out
+                }
+            }
+        }
+        EOF
+
+        cat > $K/Shaders.kt << 'EOF'
+        package com.bench.fps
+        object Shaders {
+            const val VS = """#version 300 es
+            layout(location=0) in vec3 aPos;
+            layout(location=1) in vec3 aCol;
+            uniform mat4 uMVP;
+            out vec3 vCol;
+            void main(){ vCol=aCol; gl_Position = uMVP * vec4(aPos,1.0); }"""
+            const val FS = """#version 300 es
+            precision mediump float;
+            in vec3 vCol; out vec4 FragColor;
+            void main(){ FragColor = vec4(vCol,1.0); }"""
+        }
+        EOF
+
+        cat > $K/TouchControls.kt << 'EOF'
+        package com.bench.fps
+        import android.view.MotionEvent
+        class TouchControls {
+            var moveX = 0f; var moveY = 0f
+            var lookDX = 0f; var lookDY = 0f
+            var fire = false
+            private var moveId = -1
+            private var lookId = -1
+            private var fireId = -1
+            private var moveCx = 0f; private var moveCy = 0f
+            private var lookPrevX = 0f; private var lookPrevY = 0f
+            fun onTouch(e: MotionEvent, w: Float, h: Float) {
+                when (e.actionMasked) {
+                    MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
+                        val i = e.actionIndex
+                        val x = e.getX(i); val y = e.getY(i)
+                        if (x < w * 0.35f) {
+                            moveId = e.getPointerId(i); moveCx = x; moveCy = y
+                        } else if (x > w * 0.75f && y > h * 0.6f) {
+                            fireId = e.getPointerId(i); fire = true
+                        } else {
+                            lookId = e.getPointerId(i); lookPrevX = x; lookPrevY = y
+                        }
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        for (i in 0 until e.pointerCount) {
+                            val id = e.getPointerId(i)
+                            val x = e.getX(i); val y = e.getY(i)
+                            if (id == moveId) {
+                                moveX = ((x - moveCx) / 180f).coerceIn(-1f, 1f)
+                                moveY = ((moveCy - y) / 180f).coerceIn(-1f, 1f)
+                            } else if (id == lookId) {
+                                lookDX += x - lookPrevX
+                                lookDY += y - lookPrevY
+                                lookPrevX = x; lookPrevY = y
+                            }
+                        }
+                    }
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP, MotionEvent.ACTION_CANCEL -> {
+                        val id = e.getPointerId(e.actionIndex)
+                        if (id == moveId) { moveId = -1; moveX = 0f; moveY = 0f }
+                        if (id == lookId) { lookId = -1; lookDX = 0f; lookDY = 0f }
+                        if (id == fireId) { fireId = -1; fire = false }
+                    }
+                }
+            }
+            fun consumeLook() { lookDX = 0f; lookDY = 0f }
+        }
+        EOF
+
+        cat > $K/GameRenderer.kt << 'EOF'
+        package com.bench.fps
+        import android.content.Context
+        import android.opengl.GLES30
+        import android.opengl.GLSurfaceView
+        import android.opengl.Matrix
+        import javax.microedition.khronos.egl.EGLConfig
+        import javax.microedition.khronos.opengles.GL10
+        class GameRenderer(val ctx: Context, val controls: TouchControls) : GLSurfaceView.Renderer {
+            val player = Player()
+            val world = World()
+            private var prog = 0
+            private var uMVP = 0
+            private lateinit var floor: Mesh
+            private lateinit var walls: Array<Mesh>
+            private val proj = FloatArray(16)
+            private val view = FloatArray(16)
+            private val vp = FloatArray(16)
+            private val model = FloatArray(16)
+            private val mvp = FloatArray(16)
+            private var lastFire = 0L
+            override fun onSurfaceCreated(gl: GL10?, cfg: EGLConfig?) {
+                GLES30.glClearColor(0.1f, 0.12f, 0.16f, 1f)
+                GLES30.glEnable(GLES30.GL_DEPTH_TEST)
+                prog = link(Shaders.VS, Shaders.FS)
+                uMVP = GLES30.glGetUniformLocation(prog, "uMVP")
+                floor = Mesh(Mesh.cube(0f, -0.05f, 0f, 20f, 0.1f, 20f, 0.25f, 0.28f, 0.22f))
+                walls = arrayOf(
+                    Mesh(Mesh.cube(0f, 2f, -10f, 20f, 4f, 0.3f, 0.4f, 0.4f, 0.45f)),
+                    Mesh(Mesh.cube(0f, 2f, 10f, 20f, 4f, 0.3f, 0.4f, 0.4f, 0.45f)),
+                    Mesh(Mesh.cube(-10f, 2f, 0f, 0.3f, 4f, 20f, 0.4f, 0.4f, 0.45f)),
+                    Mesh(Mesh.cube(10f, 2f, 0f, 0.3f, 4f, 20f, 0.4f, 0.4f, 0.45f))
+                )
+            }
+            override fun onSurfaceChanged(gl: GL10?, w: Int, h: Int) {
+                GLES30.glViewport(0, 0, w, h)
+                val aspect = w.toFloat() / h
+                Matrix.perspectiveM(proj, 0, 70f, aspect, 0.1f, 100f)
+            }
+            override fun onDrawFrame(gl: GL10?) {
+                val now = System.currentTimeMillis()
+                world.respawnTick()
+                updateMovement()
+                updateFire(now)
+                GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT or GLES30.GL_DEPTH_BUFFER_BIT)
+                setupCamera()
+                GLES30.glUseProgram(prog)
+                floor.draw()
+                for (w in walls) w.draw()
+                for (e in world.enemies) if (e.alive) drawEnemy(e)
+            }
+            private fun updateMovement() {
+                val sp = 0.12f
+                val fx = Math.sin(player.yaw.toDouble()).toFloat()
+                val fz = -Math.cos(player.yaw.toDouble()).toFloat()
+                val rx = Math.cos(player.yaw.toDouble()).toFloat()
+                val rz = Math.sin(player.yaw.toDouble()).toFloat()
+                player.x += (fx * controls.moveY + rx * controls.moveX) * sp
+                player.z += (fz * controls.moveY + rz * controls.moveX) * sp
+                player.yaw += controls.lookDX * 0.003f
+                player.pitch -= controls.lookDY * 0.003f
+                player.pitch = player.pitch.coerceIn(-1.2f, 1.2f)
+                controls.consumeLook()
+            }
+            private fun updateFire(now: Long) {
+                if (controls.fire && now - lastFire > 120) {
+                    lastFire = now
+                    val f = player.forward()
+                    val hit = world.raycast(player.x, player.y, player.z, f[0], f[1], f[2])
+                    if (hit != null) {
+                        val (e, zone, _) = hit
+                        e.damage(zone, 25)
+                    }
+                }
+            }
+            private fun setupCamera() {
+                val f = player.forward()
+                Matrix.setLookAtM(view, 0,
+                    player.x, player.y, player.z,
+                    player.x + f[0], player.y + f[1], player.z + f[2],
+                    0f, 1f, 0f)
+                Matrix.multiplyMM(vp, 0, proj, 0, view, 0)
+            }
+            private fun drawEnemy(e: Enemy) {
+                val parts = arrayOf(
+                    Mesh.cube(e.x, 1.65f, e.z, 0.22f, 0.22f, 0.22f, 0.85f, 0.7f, 0.6f),
+                    Mesh.cube(e.x, 1.15f, e.z, 0.45f, 0.7f, 0.25f, 0.3f, 0.45f, 0.8f),
+                    Mesh.cube(e.x - 0.12f, 0.4f, e.z, 0.18f, 0.8f, 0.2f, 0.2f, 0.25f, 0.35f),
+                    Mesh.cube(e.x + 0.12f, 0.4f, e.z, 0.18f, 0.8f, 0.2f, 0.2f, 0.25f, 0.35f)
+                )
+                for (m in parts) {
+                    Matrix.setIdentityM(model, 0)
+                    Matrix.multiplyMM(mvp, 0, vp, 0, model, 0)
+                    GLES30.glUniformMatrix4fv(uMVP, 1, false, mvp, 0)
+                    m.draw()
+                }
+            }
+            private fun link(vs: String, fs: String): Int {
+                val v = GLES30.glCreateShader(GLES30.GL_VERTEX_SHADER)
+                GLES30.glShaderSource(v, vs); GLES30.glCompileShader(v)
+                val f = GLES30.glCreateShader(GLES30.GL_FRAGMENT_SHADER)
+                GLES30.glShaderSource(f, fs); GLES30.glCompileShader(f)
+                val p = GLES30.glCreateProgram()
+                GLES30.glAttachShader(p, v); GLES30.glAttachShader(p, f); GLES30.glLinkProgram(p)
+                return p
+            }
+        }
+        EOF
+
+    - name: Build with Gradle
+      run: |
+        gradle wrapper --gradle-version 8.7
+        ./gradlew assembleDebug
+
+    - name: Upload APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: FpsShooter-APK
+        path: app/build/outputs/apk/debug/app-debug.apk
