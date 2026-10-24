@@ -1,0 +1,40 @@
+name: Build APK
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup Java
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+
+    - name: Build
+      run: |
+        mkdir -p app/src/main/kotlin/com/bench/fps
+        mkdir -p app/src/main/res/values
+        echo "pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }" > settings.gradle
+        echo "dependencyResolutionManagement { repositories { google(); mavenCentral() } }" >> settings.gradle
+        echo "rootProject.name = 'FpsShooter'" >> settings.gradle
+        echo "include ':app'" >> settings.gradle
+        echo "plugins { id 'com.android.application' version '8.5.2' apply false; id 'org.jetbrains.kotlin.android' version '1.9.24' apply false }" > build.gradle
+        echo "org.gradle.jvmargs=-Xmx2048m" > gradle.properties
+        echo "android.useAndroidX=true" >> gradle.properties
+        echo "plugins { id 'com.android.application'; id 'org.jetbrains.kotlin.android' }" > app/build.gradle
+        echo "android { namespace 'com.bench.fps'; compileSdk 34; defaultConfig { applicationId 'com.bench.fps'; minSdk 24; targetSdk 34 } }" >> app/build.gradle
+        echo "<manifest xmlns:android='http://schemas.android.com/apk/res/android'><application android:label='FpsShooter'><activity android:name='.MainActivity' android:exported='true'><intent-filter><action android:name='android.intent.action.MAIN'/><category android:name='android.intent.category.LAUNCHER'/></intent-filter></activity></application></manifest>" > app/src/main/AndroidManifest.xml
+        echo "<resources><string name='app_name'>FpsShooter</string></resources>" > app/src/main/res/values/strings.xml
+        echo "package com.bench.fps; import android.app.Activity; import android.os.Bundle; class MainActivity : Activity() { override fun onCreate(b: Bundle?) { super.onCreate(b); setContentView(GameView(this)) } }" > app/src/main/kotlin/com/bench/fps/MainActivity.kt
+        echo "package com.bench.fps; import android.content.Context; import android.opengl.GLSurfaceView; class GameView(c: Context) : GLSurfaceView(c) { init { setEGLContextClientVersion(3); setRenderer(GameRenderer()) } }" > app/src/main/kotlin/com/bench/fps/GameView.kt
+        gradle wrapper --gradle-version 8.7
+        ./gradlew assembleDebug
+
+    - name: Upload APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: FpsShooter-APK
+        path: app/build/outputs/apk/debug/app-debug.apk
